@@ -199,6 +199,7 @@ jobs:
           echo "docker=${{ hashFiles(
             'packages/sandbox/Dockerfile',
             'docker-bake.hcl',
+            'docker-images.txt',
             '.dockerignore',
             'package-lock.json',
             'package.json',
@@ -209,11 +210,12 @@ jobs:
             'tooling/typescript-config/**',
             'biome.json',
             '.bun-version',
-            'tests/e2e/test-worker/Dockerfile.standalone'
+            'tests/e2e/test-worker/Dockerfile.*'
           ) }}" >> $GITHUB_OUTPUT
           echo "deploy=${{ hashFiles(
             'packages/sandbox/Dockerfile',
             'docker-bake.hcl',
+            'docker-images.txt',
             '.dockerignore',
             'package-lock.json',
             'package.json',
@@ -224,7 +226,7 @@ jobs:
             'tooling/typescript-config/**',
             'biome.json',
             '.bun-version',
-            'tests/e2e/test-worker/Dockerfile.standalone',
+            'tests/e2e/test-worker/Dockerfile.*',
             'packages/sandbox/src/**',
             'tests/e2e/test-worker/**',
             'vitest.e2e.config.ts'
@@ -349,12 +351,15 @@ jobs:
       - name: Copy Docker images to Docker Hub
         if: ${{ needs.detect-changes.outputs.docker-changed == 'true' }}
         run: |
+          source .github/load-docker-images.sh
           BUILD_TAG="pr-${{ github.event.pull_request.number }}"
           PREVIEW="${{ steps.version.outputs.version }}"
           echo "${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}" | crane auth login index.docker.io --password-stdin -u "${{ secrets.DOCKER_HUB_USERNAME }}"
-          for suffix in "" "-python" "-opencode" "-musl" "-desktop"; do
+          for image in "${DOCKER_IMAGES[@]}"; do
+            [[ "$image" == "sandbox-standalone" ]] && continue  # CF registry only
+            suffix="${image#sandbox}"
             crane copy \
-              registry.cloudflare.com/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/sandbox${suffix}:${BUILD_TAG} \
+              registry.cloudflare.com/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/${image}:${BUILD_TAG} \
               docker.io/cloudflare/sandbox:${PREVIEW}${suffix}
           done
 
@@ -428,9 +433,21 @@ jobs:
     needs: [policy, detect-changes, build, e2e, publish-preview]
     if: ${{ always() && needs.policy.outputs.run_privileged == 'true' }}
     runs-on: ubuntu-latest
-    permissions: {}
+    permissions:
+      contents: read
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          sparse-checkout: |
+            docker-images.txt
+            .github/load-docker-images.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+          fetch-depth: 1
+
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -460,8 +477,9 @@ jobs:
         if: ${{ needs.e2e.result != 'failure' && needs.e2e.result != 'cancelled' && needs.publish-preview.result != 'failure' && needs.publish-preview.result != 'cancelled' }}
         continue-on-error: true
         run: |
+          source .github/load-docker-images.sh
           PR=${{ github.event.pull_request.number }}
-          for image in sandbox sandbox-python sandbox-opencode sandbox-standalone sandbox-musl sandbox-desktop; do
+          for image in "${DOCKER_IMAGES[@]}"; do
             wrangler containers images delete "$image:pr-$PR" 2>/dev/null || true
           done
         env:

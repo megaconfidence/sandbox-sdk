@@ -19,6 +19,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            docker-images.txt
+            .github/load-docker-images.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+          fetch-depth: 1
+
       - name: Install wrangler
         run: npm install -g wrangler@latest
 
@@ -26,8 +35,9 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         run: |
+          source .github/load-docker-images.sh
           PR=${{ github.event.pull_request.number }}
-          for image in sandbox sandbox-python sandbox-opencode sandbox-standalone sandbox-musl sandbox-desktop; do
+          for image in "${DOCKER_IMAGES[@]}"; do
             wrangler containers images delete "$image:pr-$PR" || true
           done
         env:
@@ -66,6 +76,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            docker-images.txt
+            .github/load-docker-images.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+          fetch-depth: 1
+
       - name: Install wrangler
         run: npm install -g wrangler@latest
 
@@ -111,7 +130,8 @@ jobs:
                   wrangler containers delete "$id" 2>/dev/null || true
                 done
               done
-              for image in sandbox sandbox-python sandbox-opencode sandbox-standalone sandbox-musl sandbox-desktop; do
+              source .github/load-docker-images.sh
+              for image in "${DOCKER_IMAGES[@]}"; do
                 wrangler containers images delete "$image:pr-$PR" || true
               done
             fi
