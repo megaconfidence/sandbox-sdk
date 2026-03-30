@@ -34,6 +34,9 @@ on:
       version:
         description: 'Package version from package.json'
         value: ${{ jobs.build.outputs.version }}
+      images_changed:
+        description: 'Whether any target image tag digest changed during this build'
+        value: ${{ jobs.build.outputs.images_changed }}
 
 jobs:
   build:
@@ -47,6 +50,7 @@ jobs:
       cancel-in-progress: false
     outputs:
       version: ${{ steps.version.outputs.version }}
+      images_changed: ${{ steps.image-status.outputs.changed }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -58,7 +62,14 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: ${{ !inputs.cache_readonly && 'npm' || '' }}
+
+      - name: Restore npm package cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.npm
+          key: npm-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            npm-cache-${{ runner.os }}-
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -87,6 +98,13 @@ jobs:
             examples/*/node_modules
             sites/*/node_modules
           key: node-modules-${{ hashFiles('package-lock.json') }}
+
+      - name: Save npm package cache
+        if: ${{ !inputs.cache_readonly }}
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.npm
+          key: npm-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: Build packages
         run: npx turbo run build
@@ -134,6 +152,22 @@ jobs:
           echo "$PASSWORD" | crane auth login registry.cloudflare.com --password-stdin -u "$USERNAME"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Capture pre-build digests
+        if: ${{ !inputs.skip_docker }}
+        id: pre-digest
+        run: |
+          source .github/load-docker-images.sh
+          REGISTRY="registry.cloudflare.com/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}"
+          TAG="${{ inputs.image_tag }}"
+          FINGERPRINT=""
+          for image in "${DOCKER_IMAGES[@]}"; do
+            D=$(crane digest "${REGISTRY}/${image}:${TAG}" 2>/dev/null || echo "none")
+            FINGERPRINT="${FINGERPRINT}${image}=${D};"
+          done
+          echo "fingerprint=$FINGERPRINT" >> $GITHUB_OUTPUT
+        env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Check registry for existing images
@@ -249,5 +283,32 @@ jobs:
             pids+=($!)
           done
           for pid in "${pids[@]}"; do wait "$pid"; done
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Report image status
+        id: image-status
+        if: always()
+        run: |
+          if [[ "${{ inputs.skip_docker }}" == "true" ]]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          source .github/load-docker-images.sh
+          REGISTRY="registry.cloudflare.com/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}"
+          TAG="${{ inputs.image_tag }}"
+          POST_FINGERPRINT=""
+          for image in "${DOCKER_IMAGES[@]}"; do
+            D=$(crane digest "${REGISTRY}/${image}:${TAG}" 2>/dev/null || echo "none")
+            POST_FINGERPRINT="${POST_FINGERPRINT}${image}=${D};"
+          done
+          PRE_FINGERPRINT="${{ steps.pre-digest.outputs.fingerprint }}"
+          if [[ "$POST_FINGERPRINT" != "$PRE_FINGERPRINT" ]]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "::notice::Image digests changed"
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "::notice::Image digests unchanged"
+          fi
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
