@@ -1035,6 +1035,21 @@ console.log('Terminal server on port ' + port);
         });
       }
 
+      // File Watch - Check retained change state via public Sandbox API.
+      if (url.pathname === '/api/watch/check' && request.method === 'POST') {
+        const result = await sandbox.checkChanges(body.path, {
+          recursive: body.recursive,
+          include: body.include,
+          exclude: body.exclude,
+          since: body.since,
+          sessionId: sessionId ?? undefined
+        });
+
+        return new Response(JSON.stringify(result), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
       // Cleanup endpoint - destroys the sandbox container
       // This is used by E2E tests to explicitly clean up after each test
       if (url.pathname === '/cleanup' && request.method === 'POST') {
