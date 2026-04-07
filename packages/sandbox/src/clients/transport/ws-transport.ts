@@ -119,13 +119,37 @@ export class WebSocketTransport extends BaseTransport {
   }
 
   /**
-   * Transport-specific fetch implementation
+   * Whether a WebSocket connection is currently being established.
+   *
+   * When true, awaiting `connectPromise` from a nested call would deadlock:
+   * the outer `connectViaFetch → stub.fetch → containerFetch →
+   * startAndWaitForPorts → blockConcurrencyWhile(onStart)` chain may call
+   * back into the SDK (e.g. `exec()`), which would await the same
+   * `connectPromise` that cannot resolve until `onStart` returns.
+   *
+   * Callers use this to fall back to a direct HTTP request, which is safe
+   * because `startAndWaitForPorts()` calls `setHealthy()` before invoking
+   * `onStart()`, so `containerFetch()` routes directly to the container.
+   */
+  private isWebSocketConnecting(): boolean {
+    return this.state === 'connecting';
+  }
+
+  /**
+   * Transport-specific fetch implementation.
    * Converts WebSocket response to standard Response object.
+   *
+   * Falls back to HTTP while a WebSocket connection is being established
+   * to avoid the re-entrant deadlock described in `isWebSocketConnecting()`.
    */
   protected async doFetch(
     path: string,
     options?: RequestInit
   ): Promise<Response> {
+    if (this.isWebSocketConnecting()) {
+      return this.httpFetch(path, options);
+    }
+
     await this.connect();
 
     const method = (options?.method || 'GET') as WSMethod;
@@ -141,7 +165,9 @@ export class WebSocketTransport extends BaseTransport {
   }
 
   /**
-   * Streaming fetch implementation
+   * Streaming fetch implementation.
+   *
+   * Delegates to `requestStream()`, which applies the re-entrancy guard.
    */
   async fetchStream(
     path: string,
@@ -371,7 +397,12 @@ export class WebSocketTransport extends BaseTransport {
   }
 
   /**
-   * Send a request and wait for response
+   * Send a request and wait for response.
+   *
+   * Only reachable from `doFetch()`, which already applies the re-entrancy
+   * guard via `isWebSocketConnecting()`. The `connect()` call here handles
+   * the case where the WebSocket was closed between `doFetch` and `request`
+   * (idle disconnect).
    */
   private async request<T>(
     method: WSMethod,
@@ -432,7 +463,7 @@ export class WebSocketTransport extends BaseTransport {
   }
 
   /**
-   * Send a streaming request and return a ReadableStream
+   * Send a streaming request and return a ReadableStream.
    *
    * The stream will receive data chunks as they arrive over the WebSocket.
    * Format matches SSE for compatibility with existing streaming code.
@@ -444,6 +475,9 @@ export class WebSocketTransport extends BaseTransport {
    * Uses an inactivity timeout instead of a total-duration timeout so that
    * long-running streams (e.g. execStream from an agent) stay alive as long
    * as data is flowing. The timer resets on every chunk or response message.
+   *
+   * Falls back to HTTP while a WebSocket connection is being established
+   * to avoid the re-entrant deadlock described in `isWebSocketConnecting()`.
    */
   private async requestStream(
     method: WSMethod,
@@ -451,6 +485,14 @@ export class WebSocketTransport extends BaseTransport {
     body?: unknown,
     headers?: Record<string, string>
   ): Promise<ReadableStream<Uint8Array>> {
+    if (this.isWebSocketConnecting()) {
+      return this.httpFetchStream(
+        path,
+        body,
+        method as 'GET' | 'POST',
+        headers
+      );
+    }
     await this.connect();
     this.clearIdleDisconnectTimer();
 
