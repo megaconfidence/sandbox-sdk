@@ -1,5 +1,6 @@
 import type { Logger } from '@repo/shared';
 import { logCanonicalEvent, shellEscape } from '@repo/shared';
+import { BACKUP_ALLOWED_PREFIXES } from '@repo/shared/backup';
 import { ErrorCode, Operation } from '@repo/shared/errors';
 import type { ServiceResult } from '../core/types';
 import { serviceError, serviceSuccess } from '../core/types';
@@ -21,24 +22,12 @@ const BIN = {
   fusermount: '/usr/bin/fusermount3'
 } as const;
 
-/**
- * Prefixes of directories that are safe for backup/restore operations.
- * Using an allowlist is more secure than a blocklist - unknown paths are rejected.
- */
-const ALLOWED_PREFIXES = ['/workspace', '/home', '/tmp', '/var/tmp'];
-
-/**
- * Directories that must never be backed up or restored into, even if under allowed prefixes.
- */
-const FORBIDDEN_DIRS = new Set(['/']);
-
 function isSafeAbsolutePath(path: string): boolean {
   return (
     typeof path === 'string' &&
     path.startsWith('/') &&
     !path.includes('..') &&
-    !path.includes('\0') &&
-    !FORBIDDEN_DIRS.has(path)
+    !path.includes('\0')
   );
 }
 
@@ -47,18 +36,18 @@ function isSafeAbsolutePath(path: string): boolean {
  * Defense-in-depth: the DO already validates, but the container
  * re-checks to guard against programming errors or future callers.
  *
- * Uses allowlist approach: only paths under /workspace, /home, /tmp, /var/tmp are permitted.
+ * Uses allowlist approach: only paths under supported backup roots are permitted.
  */
 function validateBackupPaths(dir: string, archivePath: string): string | null {
   if (!isSafeAbsolutePath(dir)) {
-    return `Backup directory must be a safe absolute path (no '..' or null bytes) under an allowed prefix (${ALLOWED_PREFIXES.join(', ')}): ${dir}`;
+    return `Backup directory must be a safe absolute path (no '..' or null bytes) under an allowed prefix (${BACKUP_ALLOWED_PREFIXES.join(', ')}): ${dir}`;
   }
   // Allowlist check: dir must start with one of the allowed prefixes
-  const isAllowed = ALLOWED_PREFIXES.some(
+  const isAllowed = BACKUP_ALLOWED_PREFIXES.some(
     (prefix) => dir === prefix || dir.startsWith(`${prefix}/`)
   );
   if (!isAllowed) {
-    return `Directory not in allowed paths (${ALLOWED_PREFIXES.join(', ')}): ${dir}`;
+    return `Directory not in allowed paths (${BACKUP_ALLOWED_PREFIXES.join(', ')}): ${dir}`;
   }
   if (!archivePath.startsWith(`${BACKUP_WORK_DIR}/`)) {
     return 'Invalid archivePath: must use designated backup directory';

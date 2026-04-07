@@ -44,6 +44,7 @@ import {
   shellEscape,
   TraceContext
 } from '@repo/shared';
+import { BACKUP_ALLOWED_PREFIXES } from '@repo/shared/backup';
 import { AwsClient } from 'aws4fetch';
 import { type Desktop, type ExecuteResponse, SandboxClient } from './clients';
 import type { ErrorResponse } from './errors';
@@ -3504,7 +3505,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
 
       // Backup operations - sandbox-level, uses R2 binding
       createBackup: (options) => this.createBackup(options),
-      restoreBackup: (backup) => this.restoreBackup(backup)
+      restoreBackup: (backup: DirectoryBackup) => this.restoreBackup(backup)
     };
   }
 
@@ -3551,7 +3552,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
 
   /**
    * Validate that a directory path is safe for backup operations.
-   * Rejects empty, relative, traversal, and null-byte paths.
+   * Rejects empty, relative, traversal, null-byte, and unsupported-root paths.
    */
   private static validateBackupDir(dir: string, label: string): void {
     if (!dir || !dir.startsWith('/')) {
@@ -3578,6 +3579,20 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
         code: ErrorCode.INVALID_BACKUP_CONFIG,
         httpStatus: 400,
         context: { reason: `${label} must not contain ".." path segments` },
+        timestamp: new Date().toISOString()
+      });
+    }
+    const isAllowed = BACKUP_ALLOWED_PREFIXES.some(
+      (prefix) => dir === prefix || dir.startsWith(`${prefix}/`)
+    );
+    if (!isAllowed) {
+      throw new InvalidBackupConfigError({
+        message: `${label} must be inside one of the supported backup roots (${BACKUP_ALLOWED_PREFIXES.join(', ')})`,
+        code: ErrorCode.INVALID_BACKUP_CONFIG,
+        httpStatus: 400,
+        context: {
+          reason: `${label} must be inside one of the supported backup roots`
+        },
         timestamp: new Date().toISOString()
       });
     }
@@ -4110,7 +4125,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     const restoreStartTime = Date.now();
     const bucket = this.requireBackupBucket();
     this.requirePresignedUrlSupport();
-    const { id: backupId, dir } = backup;
+    const { id, dir } = backup;
 
     let outcome: 'success' | 'error' = 'error';
     let caughtError: Error | undefined;
@@ -4118,7 +4133,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
 
     try {
       // Validate user-provided inputs (DirectoryBackup is deserialized from external storage)
-      if (!backupId || typeof backupId !== 'string') {
+      if (!id || typeof id !== 'string') {
         throw new InvalidBackupConfigError({
           message: 'Invalid backup: missing or invalid id',
           code: ErrorCode.INVALID_BACKUP_CONFIG,
@@ -4127,7 +4142,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
           timestamp: new Date().toISOString()
         });
       }
-      if (!Sandbox.UUID_REGEX.test(backupId)) {
+      if (!Sandbox.UUID_REGEX.test(id)) {
         throw new InvalidBackupConfigError({
           message:
             'Invalid backup: id must be a valid UUID (e.g. from createBackup)',
@@ -4140,16 +4155,16 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       Sandbox.validateBackupDir(dir, 'Invalid backup: dir');
 
       // Step 1: Read metadata to check TTL
-      const metaKey = `backups/${backupId}/meta.json`;
+      const metaKey = `backups/${id}/meta.json`;
       const metaObject = await bucket.get(metaKey);
       if (!metaObject) {
         throw new BackupNotFoundError({
           message:
-            `Backup not found: ${backupId}. ` +
+            `Backup not found: ${id}. ` +
             'Verify the backup ID is correct and the backup has not been deleted.',
           code: ErrorCode.BACKUP_NOT_FOUND,
           httpStatus: 404,
-          context: { backupId },
+          context: { backupId: id },
           timestamp: new Date().toISOString()
         });
       }
@@ -4168,7 +4183,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
           message: `Backup metadata has invalid createdAt timestamp: ${metadata.createdAt}`,
           code: ErrorCode.BACKUP_RESTORE_FAILED,
           httpStatus: 500,
-          context: { dir, backupId },
+          context: { dir, backupId: id },
           timestamp: new Date().toISOString()
         });
       }
@@ -4176,13 +4191,13 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       if (Date.now() + TTL_BUFFER_MS > expiresAt) {
         throw new BackupExpiredError({
           message:
-            `Backup ${backupId} has expired ` +
+            `Backup ${id} has expired ` +
             `(created: ${metadata.createdAt}, TTL: ${metadata.ttl}s). ` +
             'Create a new backup.',
           code: ErrorCode.BACKUP_EXPIRED,
           httpStatus: 400,
           context: {
-            backupId,
+            backupId: id,
             expiredAt: new Date(expiresAt).toISOString()
           },
           timestamp: new Date().toISOString()
@@ -4190,22 +4205,22 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       }
 
       // Step 2: Check archive exists and get its size via HEAD (no body stream)
-      const r2Key = `backups/${backupId}/data.sqsh`;
+      const r2Key = `backups/${id}/data.sqsh`;
       const archiveHead = await bucket.head(r2Key);
       if (!archiveHead) {
         throw new BackupNotFoundError({
           message:
-            `Backup archive not found in R2: ${backupId}. ` +
+            `Backup archive not found in R2: ${id}. ` +
             'The archive may have been deleted by R2 lifecycle rules.',
           code: ErrorCode.BACKUP_NOT_FOUND,
           httpStatus: 404,
-          context: { backupId },
+          context: { backupId: id },
           timestamp: new Date().toISOString()
         });
       }
 
       backupSession = await this.ensureBackupSession();
-      const archivePath = `/var/backups/${backupId}.sqsh`;
+      const archivePath = `/var/backups/${id}.sqsh`;
 
       // Step 3: Tear down existing FUSE mounts before overwriting the archive.
       // squashfuse holds the .sqsh file open; writing a new archive to the same
@@ -4213,7 +4228,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       // Unmount the overlay on dir, then iterate over all mount bases for this
       // backup (both suffixed UUID_* and legacy unsuffixed UUID) and unmount
       // their squashfuse lower dirs.
-      const mountGlob = `/var/backups/mounts/${backupId}`;
+      const mountGlob = `/var/backups/mounts/${id}`;
       await this.execWithSession(
         `/usr/bin/fusermount3 -uz ${shellEscape(dir)} 2>/dev/null || true`,
         backupSession,
@@ -4244,7 +4259,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
           archivePath,
           r2Key,
           archiveHead.size,
-          backupId,
+          id,
           dir,
           backupSession
         );
@@ -4261,7 +4276,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
           message: 'Container failed to restore backup archive',
           code: ErrorCode.BACKUP_RESTORE_FAILED,
           httpStatus: 500,
-          context: { dir, backupId },
+          context: { dir, backupId: id },
           timestamp: new Date().toISOString()
         });
       }
@@ -4271,14 +4286,14 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       return {
         success: true,
         dir,
-        id: backupId
+        id
       };
     } catch (error) {
       caughtError = error instanceof Error ? error : new Error(String(error));
       // Clean up archive file on failure only — squashfuse needs it as
       // backing storage for the lifetime of the mount
-      if (backupId && backupSession) {
-        const archivePath = `/var/backups/${backupId}.sqsh`;
+      if (id && backupSession) {
+        const archivePath = `/var/backups/${id}.sqsh`;
         await this.execWithSession(
           `rm -f ${shellEscape(archivePath)}`,
           backupSession,
@@ -4294,7 +4309,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
         event: 'backup.restore',
         outcome,
         durationMs: Date.now() - restoreStartTime,
-        backupId,
+        backupId: id,
         dir,
         error: caughtError
       });
