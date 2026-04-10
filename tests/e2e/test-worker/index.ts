@@ -546,7 +546,8 @@ console.log('Terminal server on port ' + port);
         const result = await executor.gitCheckout(body.repoUrl, {
           branch: body.branch,
           targetDir: body.targetDir,
-          depth: body.depth
+          depth: body.depth,
+          cloneTimeoutMs: body.cloneTimeoutMs
         });
         return new Response(JSON.stringify(result), {
           headers: { 'Content-Type': 'application/json' }
