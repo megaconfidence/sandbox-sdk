@@ -915,6 +915,10 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     mountPath: string,
     options: MountBucketOptions
   ): Promise<void> {
+    if (options.prefix !== undefined) {
+      validatePrefix(options.prefix);
+    }
+
     if ('localBucket' in options && options.localBucket) {
       await this.mountBucketLocal(bucket, mountPath, options);
       return;
@@ -1224,10 +1228,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       );
     }
 
-    // Validate prefix format if provided
-    if (options.prefix !== undefined) {
-      validatePrefix(options.prefix);
-    }
+    // Prefix validation is handled centrally in mountBucket()
   }
 
   /**
