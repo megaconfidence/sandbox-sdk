@@ -1,5 +1,6 @@
 import { Container } from '@cloudflare/containers';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { PortNotExposedError } from '../src/errors';
 import { connect, Sandbox } from '../src/sandbox';
 
 // Mock dependencies before imports
@@ -1242,6 +1243,164 @@ describe('Sandbox - Automatic Session Management', () => {
         9000,
         expect.any(String),
         undefined
+      );
+    });
+  });
+
+  describe('validatePortToken', () => {
+    beforeEach(() => {
+      // Spy on getExposedPorts so a regression that reintroduces the
+      // container round-trip is catchable via not.toHaveBeenCalled().
+      vi.spyOn(sandbox.client.ports, 'getExposedPorts').mockResolvedValue({
+        success: true,
+        ports: [],
+        count: 0,
+        timestamp: new Date().toISOString()
+      } as any);
+
+      vi.mocked(mockCtx.storage.get).mockImplementation(async (key) =>
+        key === 'portTokens' ? { '8080': { token: 'correcttoken' } } : null
+      );
+    });
+
+    it('returns true for a matching token without calling the container', async () => {
+      const result = await sandbox.validatePortToken(8080, 'correcttoken');
+
+      expect(result).toBe(true);
+      expect(sandbox.client.ports.getExposedPorts).not.toHaveBeenCalled();
+    });
+
+    it('returns false for a mismatched token', async () => {
+      const result = await sandbox.validatePortToken(8080, 'wrongtoken');
+
+      expect(result).toBe(false);
+    });
+
+    it('returns false when no token is stored for the port', async () => {
+      vi.mocked(mockCtx.storage.get).mockImplementation(async (key) =>
+        key === 'portTokens' ? {} : null
+      );
+
+      const result = await sandbox.validatePortToken(8080, 'anytoken');
+
+      expect(result).toBe(false);
+    });
+
+    it('accepts legacy string-valued tokens from storage', async () => {
+      // readPortTokens normalizes the { port: string } storage shape
+      // to { port: { token: string } }; legacy entries must still
+      // authenticate.
+      vi.mocked(mockCtx.storage.get).mockImplementation(async (key) =>
+        key === 'portTokens' ? { '8080': 'legacytoken' } : null
+      );
+
+      const result = await sandbox.validatePortToken(8080, 'legacytoken');
+
+      expect(result).toBe(true);
+    });
+
+    it('does not call isPortExposed', async () => {
+      const spy = vi.spyOn(sandbox, 'isPortExposed');
+
+      await sandbox.validatePortToken(8080, 'correcttoken');
+
+      expect(spy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('unexposePort ordering', () => {
+    beforeEach(() => {
+      vi.mocked(mockCtx.storage.get).mockImplementation(async (key) =>
+        key === 'portTokens' ? { '8080': { token: 'sometoken' } } : null
+      );
+      vi.spyOn(sandbox.client.ports, 'unexposePort').mockResolvedValue(
+        undefined as any
+      );
+    });
+
+    it('revokes the token from storage before the container RPC', async () => {
+      const calls: string[] = [];
+      vi.mocked(mockCtx.storage.put).mockImplementation(async (key) => {
+        if (key === 'portTokens') {
+          calls.push('storage');
+        }
+      });
+      vi.mocked(sandbox.client.ports.unexposePort).mockImplementation(
+        async () => {
+          calls.push('container');
+          return {
+            success: true,
+            port: 8080,
+            timestamp: new Date().toISOString()
+          };
+        }
+      );
+
+      await sandbox.unexposePort(8080);
+
+      expect(calls).toEqual(['storage', 'container']);
+    });
+
+    it('treats PortNotExposedError from the container as success', async () => {
+      vi.mocked(sandbox.client.ports.unexposePort).mockRejectedValue(
+        new PortNotExposedError({
+          error: 'Port not exposed: 8080',
+          code: 'PORT_NOT_EXPOSED',
+          context: { port: 8080 }
+        } as any)
+      );
+
+      await expect(sandbox.unexposePort(8080)).resolves.toBeUndefined();
+      expect(mockCtx.storage.put).toHaveBeenCalledWith(
+        'portTokens',
+        expect.not.objectContaining({ '8080': expect.anything() })
+      );
+    });
+
+    it('rethrows non-PortNotExposedError failures from the container', async () => {
+      vi.mocked(sandbox.client.ports.unexposePort).mockRejectedValue(
+        new Error('network failure')
+      );
+
+      await expect(sandbox.unexposePort(8080)).rejects.toThrow(
+        'network failure'
+      );
+    });
+  });
+
+  describe('getExposedPorts orphan handling', () => {
+    beforeEach(async () => {
+      await sandbox.setSandboxName('test-sandbox');
+
+      vi.spyOn(sandbox.client.ports, 'getExposedPorts').mockResolvedValue({
+        success: true,
+        ports: [
+          { port: 8080, exposedAt: new Date().toISOString() },
+          { port: 9090, exposedAt: new Date().toISOString() }
+        ],
+        count: 2,
+        timestamp: new Date().toISOString()
+      } as any);
+
+      // Storage has a token for 9090 but not for 8080, so 8080 is an
+      // orphan from getExposedPorts()'s perspective.
+      vi.mocked(mockCtx.storage.get).mockImplementation(async (key) => {
+        if (key === 'portTokens') return { '9090': { token: 'token9090' } };
+        if (key === 'sandboxName') return 'test-sandbox';
+        return null;
+      });
+    });
+
+    it('omits ports with no token from the result', async () => {
+      const warnSpy = vi.spyOn((sandbox as any).logger, 'warn');
+
+      const result = await sandbox.getExposedPorts('example.com');
+
+      expect(result).toHaveLength(1);
+      expect(result[0].port).toBe(9090);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('no token in storage'),
+        expect.objectContaining({ port: 8080 })
       );
     });
   });
