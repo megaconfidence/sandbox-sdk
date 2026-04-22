@@ -48,7 +48,6 @@ jobs:
     outputs:
       http-url: ${{ steps.urls.outputs.http_url }}
       ws-url: ${{ steps.urls.outputs.ws_url }}
-      capnweb-url: ${{ steps.urls.outputs.capnweb_url }}
     steps:
       - name: Check if deploy can be skipped
         if: ${{ inputs.deploy_hash != '' }}
@@ -58,7 +57,7 @@ jobs:
 
           # Check all workers — all must match to skip
           ALL_MATCH=true
-          for TRANSPORT in http websocket capnweb; do
+          for TRANSPORT in http websocket; do
             URL="https://${{ inputs.worker_name_prefix }}-${TRANSPORT}.${{ env.CF_ACCOUNT_SUBDOMAIN }}.workers.dev/health"
             HASH=$(curl -sf --max-time 10 "$URL" 2>/dev/null | jq -r '.deploy_hash // ""' 2>/dev/null || echo "")
             if [[ "$HASH" != "$EXPECTED" ]]; then
@@ -77,8 +76,8 @@ jobs:
 
       # --- Capacity guard (only when deploy is needed) ---
       # Ensures enough container app headroom before deploying. Each PR
-      # creates 18 container apps (3 workers × 6 classes). The account
-      # has a ~100 app limit. We keep a budget of 84 (leaving 16 headroom)
+      # creates 12 container apps (2 workers × 6 classes). The account
+      # has a ~600 app limit. We keep a budget of 500 (leaving 100 headroom)
       # and evict the least-recently-active PR's resources when over budget.
       # Protects: current PR, main workers, and PRs with in-progress CI.
       - uses: actions/setup-node@v6
@@ -93,8 +92,8 @@ jobs:
       - name: Ensure container app capacity
         if: ${{ steps.deploy-check.outputs.skip != 'true' }}
         run: |
-          SAFE_BUDGET=84
-          EXPECTED_PR_APPS=18
+          SAFE_BUDGET=500
+          EXPECTED_PR_APPS=12
 
           CONTAINERS=$(wrangler containers list --json 2>/dev/null)
           if [ $? -ne 0 ] || [ -z "$CONTAINERS" ]; then
@@ -170,7 +169,7 @@ jobs:
             # Re-read live state to avoid double-counting with concurrent evictions
             LIVE_CONTAINERS=$(wrangler containers list --json 2>/dev/null || echo "[]")
             EVICTED=0
-            for suffix in "-http" "-websocket" "-capnweb"; do
+            for suffix in "-http" "-websocket"; do
               WORKER="sandbox-e2e-test-worker-pr-${PR_NUM}${suffix}"
               IDS=$(echo "$LIVE_CONTAINERS" | jq -r --arg w "$WORKER" \
                 '.[] | select(.name | startswith($w)) | .id' 2>/dev/null)
@@ -241,7 +240,7 @@ jobs:
       - name: Deploy and configure workers
         if: ${{ steps.deploy-check.outputs.skip != 'true' }}
         run: |
-          for TRANSPORT in http websocket capnweb; do
+          for TRANSPORT in http websocket; do
             WORKER="${{ inputs.worker_name_prefix }}-${TRANSPORT}"
             echo "::group::Deploy ${TRANSPORT} worker"
             cd tests/e2e/test-worker
@@ -277,13 +276,37 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           DEPLOY_HASH: ${{ inputs.deploy_hash }}
 
+      - name: Warm container pool
+        if: ${{ steps.deploy-check.outputs.skip != 'true' }}
+        run: |
+          CONTAINERS=$(wrangler containers list --json 2>/dev/null || echo "[]")
+
+          for TRANSPORT in http websocket; do
+            WORKER="${{ inputs.worker_name_prefix }}-${TRANSPORT}"
+            APP_IDS=$(echo "$CONTAINERS" | jq -r --arg w "$WORKER" \
+              '[.[] | select(.name | startswith($w))] | .[].id')
+            if [ -z "$APP_IDS" ]; then
+              echo "::warning::No container apps found for ${WORKER} — skipping warm pool"
+              continue
+            fi
+            for APP_ID in $APP_IDS; do
+              echo "Setting warm pool for ${WORKER} (app $APP_ID)"
+              curl -sf -X PATCH \
+                "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/containers/applications/${APP_ID}" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d '{"configuration":{"durable_object_offset_instances": 75}}' || echo "::warning::Failed to set warm pool for app ${APP_ID}"
+            done
+          done
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       # Always set URLs (deterministic, needed by test jobs)
       - name: Set worker URLs
         id: urls
         run: |
           echo "http_url=https://${{ inputs.worker_name_prefix }}-http.${{ env.CF_ACCOUNT_SUBDOMAIN }}.workers.dev" >> $GITHUB_OUTPUT
           echo "ws_url=https://${{ inputs.worker_name_prefix }}-websocket.${{ env.CF_ACCOUNT_SUBDOMAIN }}.workers.dev" >> $GITHUB_OUTPUT
-          echo "capnweb_url=https://${{ inputs.worker_name_prefix }}-capnweb.${{ env.CF_ACCOUNT_SUBDOMAIN }}.workers.dev" >> $GITHUB_OUTPUT
 
   test-vitest:
     permissions:
@@ -301,9 +324,6 @@ jobs:
           - transport: websocket
             worker_url: ws-url
             sandbox_id: e2e-ws
-          - transport: capnweb
-            worker_url: capnweb-url
-            sandbox_id: e2e-capnweb
     steps:
       - uses: actions/checkout@v6
         with:
