@@ -182,6 +182,7 @@ jobs:
         env:
           TEST_WORKER_URL: ${{ needs.setup.outputs.worker_url }}
           CI: true
+          PERF_RUN_ID: ${{ github.run_id }}
         run: |
           if [ "${{ inputs.scenario }}" = "all" ] || [ -z "${{ inputs.scenario }}" ]; then
             npm run test:perf
@@ -214,3 +215,18 @@ jobs:
           PERF_D1_RETENTION_DAYS: 90
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: npx tsx tests/perf/scripts/ingest-to-d1.ts perf-results/latest.json
+
+      - name: Call notifier webhook
+        if: always() && secrets.PERF_NOTIFIER_WEBHOOK_URL != ''
+        env:
+          WEBHOOK_URL: ${{ secrets.PERF_NOTIFIER_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.PERF_NOTIFIER_API_SECRET }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.PERF_CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.PERF_CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          curl -sf -X POST "$WEBHOOK_URL/api/notify" \
+            -H "Authorization: Bearer $WEBHOOK_SECRET" \
+            -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+            -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+            -H "Content-Type: application/json" \
+            -d '{"run_id": "perf-${{ github.run_id }}"}'
