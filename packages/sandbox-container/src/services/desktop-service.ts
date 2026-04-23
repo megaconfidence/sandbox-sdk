@@ -19,6 +19,8 @@ import type {
   DesktopStatusResult,
   DesktopStopResult,
   DesktopTypeRequest,
+  DesktopWorkerRequest,
+  DesktopWorkerResponse,
   Logger
 } from '@repo/shared';
 import type { ServiceResult } from '../core/types';
@@ -27,7 +29,8 @@ import { DesktopManager } from '../managers/desktop-manager';
 
 export class DesktopService {
   private manager: DesktopManager;
-  private worker: Worker | null = null;
+  private worker: import('bun').Subprocess<'pipe', 'pipe', 'pipe'> | null =
+    null;
   private pending = new Map<
     string,
     { resolve: (value: unknown) => void; reject: (reason: Error) => void }
@@ -60,10 +63,12 @@ export class DesktopService {
 
   async stop(): Promise<ServiceResult<DesktopStopResult>> {
     try {
-      if (this.worker) {
-        this.worker.terminate();
-        this.worker = null;
-      }
+      // Terminate the worker process BEFORE killing X11 processes.
+      // The worker holds an FFI connection to X11 via robotgo. Killing
+      // Xvfb while FFI calls are in flight would leave them in an
+      // undefined state. Stopping the worker first ensures a clean
+      // teardown with no outstanding X11 operations.
+      await this.terminateWorker();
 
       for (const [, handler] of this.pending) {
         handler.reject(new Error('Desktop service stopped'));
@@ -71,6 +76,7 @@ export class DesktopService {
       this.pending.clear();
 
       await this.manager.stop();
+
       return serviceSuccess<DesktopStopResult>({ success: true });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -372,60 +378,186 @@ export class DesktopService {
     }
   }
 
+  private static readonly WORKER_OP_TIMEOUT_MS = 10_000;
+  private static readonly WORKER_TERMINATE_TIMEOUT_MS = 2_000;
+
   private async sendToWorker(
-    op: string,
+    op: DesktopWorkerRequest['op'],
     args?: Record<string, unknown>
   ): Promise<unknown> {
+    this.ensureDesktopActive();
     this.ensureWorkerRunning();
     const id = crypto.randomUUID();
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.worker?.postMessage({ id, op, ...args });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(
+          new Error(
+            `Worker operation '${op}' timed out after ${DesktopService.WORKER_OP_TIMEOUT_MS}ms`
+          )
+        );
+      }, DesktopService.WORKER_OP_TIMEOUT_MS);
+
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (reason) => {
+          clearTimeout(timer);
+          reject(reason);
+        }
+      });
+      if (this.worker?.stdin) {
+        const request = { id, op, ...args } as unknown as DesktopWorkerRequest;
+        this.worker.stdin.write(`${JSON.stringify(request)}\n`);
+      }
     });
   }
 
   private ensureWorkerRunning(): void {
     if (!this.worker) {
-      // Compiled binary: worker is at /container-server/workers/desktop-worker.js
-      // Dev mode: resolve relative to this source file via import.meta.url
       const compiledWorkerPath = '/container-server/workers/desktop-worker.js';
       const workerPath = existsSync(compiledWorkerPath)
         ? compiledWorkerPath
-        : new URL('../workers/desktop-worker.ts', import.meta.url).href;
-      this.worker = new Worker(workerPath);
-      this.worker.onmessage = (event: MessageEvent) => {
-        const { id, result, error } = event.data;
-        const handler = this.pending.get(id);
-        if (handler) {
-          this.pending.delete(id);
-          if (error) {
-            handler.reject(new Error(error));
-          } else {
-            handler.resolve(result);
-          }
+        : new URL('../workers/desktop-worker.ts', import.meta.url).pathname;
+
+      const worker = Bun.spawn(['bun', 'run', workerPath], {
+        stdin: 'pipe',
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: { ...Bun.env, DISPLAY: Bun.env.DISPLAY ?? ':99' }
+      });
+      this.worker = worker;
+
+      // Stream readers run for the lifetime of this worker instance.
+      // Passing the instance explicitly avoids a race where the reader's
+      // cleanup nulls a reference that already points at a newer worker.
+      this.readWorkerOutput(worker).catch((error) => {
+        this.logger.error('Desktop worker stdout reader failed', undefined, {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+      this.pipeStderr(worker).catch((error) => {
+        this.logger.warn('Desktop worker stderr reader failed', {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+    }
+  }
+
+  private async readWorkerOutput(
+    worker: import('bun').Subprocess<'pipe', 'pipe', 'pipe'>
+  ): Promise<void> {
+    if (!worker.stdout) return;
+    const reader = worker.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value);
+        let newlineIdx = buffer.indexOf('\n');
+        while (newlineIdx !== -1) {
+          const line = buffer.slice(0, newlineIdx);
+          buffer = buffer.slice(newlineIdx + 1);
+          if (line) this.handleWorkerLine(line);
+          newlineIdx = buffer.indexOf('\n');
         }
-      };
-      this.worker.onerror = (event) => {
-        const message = event instanceof Error ? event.message : String(event);
-        this.logger.error('Desktop worker crashed', undefined, { message });
-        for (const [id, handler] of this.pending) {
-          handler.reject(new Error(`Worker crashed: ${message}`));
-          this.pending.delete(id);
-        }
-        this.worker = null;
-      };
+      }
+    } catch {
+      // Stream closed — expected during shutdown
+    }
+    // Only clean up if this reader still owns the active worker. If a
+    // newer worker has already been spawned (for example via start()
+    // racing with the exit of the previous one), leave its state intact.
+    if (this.worker === worker) {
+      for (const [id, handler] of this.pending) {
+        handler.reject(new Error('Worker process exited'));
+        this.pending.delete(id);
+      }
+      this.worker = null;
+    }
+  }
+
+  private handleWorkerLine(line: string): void {
+    let parsed: DesktopWorkerResponse;
+    try {
+      parsed = JSON.parse(line) as DesktopWorkerResponse;
+    } catch {
+      this.logger.warn('Failed to parse worker output', { line });
+      return;
+    }
+    const handler = this.pending.get(parsed.id);
+    if (!handler) return;
+    this.pending.delete(parsed.id);
+    if ('error' in parsed) {
+      handler.reject(new Error(parsed.error));
+    } else {
+      handler.resolve(parsed.result);
+    }
+  }
+
+  private async pipeStderr(
+    worker: import('bun').Subprocess<'pipe', 'pipe', 'pipe'>
+  ): Promise<void> {
+    if (!worker.stderr) return;
+    const reader = worker.stderr.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value).trim();
+        // Logged at warn since the worker only writes to stderr when
+        // something went wrong (FFI load failures, robotgo errors).
+        if (text) this.logger.warn('desktop-worker stderr', { text });
+      }
+    } catch {
+      // Expected during shutdown
     }
   }
 
   async destroy(): Promise<void> {
-    if (this.worker) {
-      this.worker.terminate();
-      this.worker = null;
-    }
-    await this.manager.stop();
+    await this.terminateWorker();
     for (const [, handler] of this.pending) {
       handler.reject(new Error('Desktop service destroyed'));
     }
     this.pending.clear();
+    await this.manager.stop();
+  }
+
+  /**
+   * Kill the worker child process.
+   * Since it runs in a separate process, a segfault in the FFI layer
+   * cannot crash the Bun HTTP server.
+   */
+  private async terminateWorker(): Promise<void> {
+    if (!this.worker) return;
+    const proc = this.worker;
+    this.worker = null;
+
+    try {
+      proc.kill('SIGTERM');
+      const deadline = new Promise<'timeout'>((resolve) =>
+        setTimeout(
+          () => resolve('timeout'),
+          DesktopService.WORKER_TERMINATE_TIMEOUT_MS
+        )
+      );
+      const result = await Promise.race([
+        proc.exited.then(() => 'exited' as const),
+        deadline
+      ]);
+      if (result === 'timeout') {
+        this.logger.warn(
+          'Worker process did not exit after SIGTERM, sending SIGKILL'
+        );
+        proc.kill('SIGKILL');
+      }
+    } catch {
+      // Process already exited
+    }
   }
 }

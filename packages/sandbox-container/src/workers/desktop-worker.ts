@@ -1,8 +1,14 @@
-// Runs in a dedicated Bun Worker thread.
+// Runs in a dedicated child process (not a Worker thread).
 // Owns all koffi bindings to desktop.so (robotgo).
 // Operations are serialized: one at a time, in order.
+// Communicates with the parent via newline-delimited JSON on stdin/stdout.
 
-declare var self: Worker;
+import type {
+  DesktopWorkerOp,
+  DesktopWorkerRequest,
+  DesktopWorkerResponse,
+  DesktopWorkerResultMap
+} from '@repo/shared';
 
 // koffi library handle — typed as unknown since koffi types are loaded dynamically
 let lib: unknown = null;
@@ -132,140 +138,153 @@ function loadLibrary(): boolean {
   }
 }
 
-self.onmessage = (event: MessageEvent) => {
-  const { id, op, ...args } = event.data;
+function reply(data: DesktopWorkerResponse): void {
+  process.stdout.write(`${JSON.stringify(data)}\n`);
+}
 
+type Handler<Op extends DesktopWorkerOp> = (
+  msg: Extract<DesktopWorkerRequest, { op: Op }>
+) => DesktopWorkerResultMap[Op];
+
+const handlers: { [Op in DesktopWorkerOp]: Handler<Op> } = {
+  screenshot: (msg) => {
+    const sx = Math.max(0, msg.x);
+    const sy = Math.max(0, msg.y);
+    if (msg.w <= 0 || msg.h <= 0) {
+      throw new Error(`Invalid screenshot dimensions: ${msg.w}x${msg.h}`);
+    }
+    checkError(
+      bindings.screenshot!(msg.path, sx, sy, msg.w, msg.h),
+      'Screenshot'
+    );
+    return { success: true, path: msg.path };
+  },
+  click: (msg) => {
+    const btn = msg.button ?? 'left';
+    const count = msg.clickCount ?? 1;
+    checkError(bindings.move!(Math.trunc(msg.x), Math.trunc(msg.y)), 'Move');
+    checkError(bindings.click!(btn, count), 'Click');
+    return { success: true };
+  },
+  move: (msg) => {
+    checkError(bindings.move!(Math.trunc(msg.x), Math.trunc(msg.y)), 'Move');
+    return { success: true };
+  },
+  moveSmooth: (msg) => {
+    const mx = Math.trunc(msg.x);
+    const my = Math.trunc(msg.y);
+    checkError(
+      bindings.moveSmooth!(mx, my, msg.low ?? 5, msg.high ?? 10),
+      `MoveSmooth(${mx}, ${my})`
+    );
+    return { success: true };
+  },
+  scroll: (msg) => {
+    checkError(bindings.move!(Math.trunc(msg.x), Math.trunc(msg.y)), 'Move');
+    checkError(bindings.scroll!(msg.scrollX ?? 0, msg.scrollY ?? 0), 'Scroll');
+    return { success: true };
+  },
+  type: (msg) => {
+    checkError(bindings.typeText!(msg.text, msg.pid ?? 0), 'TypeText');
+    return { success: true };
+  },
+  keyTap: (msg) => {
+    checkError(bindings.keyTap!(msg.key, msg.modifiers ?? ''), 'KeyTap');
+    return { success: true };
+  },
+  getScreenSize: () => bindings.getScreenSize!(),
+  getMousePos: () => bindings.getMousePos!(),
+  mouseDown: (msg) => {
+    if (msg.x !== undefined && msg.y !== undefined) {
+      checkError(bindings.move!(Math.trunc(msg.x), Math.trunc(msg.y)), 'Move');
+    }
+    checkError(bindings.mouseDown!(msg.button ?? 'left'), 'MouseDown');
+    return { success: true };
+  },
+  mouseUp: (msg) => {
+    if (msg.x !== undefined && msg.y !== undefined) {
+      checkError(bindings.move!(Math.trunc(msg.x), Math.trunc(msg.y)), 'Move');
+    }
+    checkError(bindings.mouseUp!(msg.button ?? 'left'), 'MouseUp');
+    return { success: true };
+  },
+  keyDown: (msg) => {
+    checkError(bindings.keyDown!(msg.key), 'KeyDown');
+    return { success: true };
+  },
+  keyUp: (msg) => {
+    checkError(bindings.keyUp!(msg.key), 'KeyUp');
+    return { success: true };
+  },
+  drag: (msg) => {
+    const sx = Math.trunc(msg.startX);
+    const sy = Math.trunc(msg.startY);
+    const ex = Math.trunc(msg.endX);
+    const ey = Math.trunc(msg.endY);
+    const btn = msg.button ?? 'left';
+    checkError(bindings.move!(sx, sy), 'Move');
+    checkError(bindings.mouseDown!(btn), 'MouseDown');
+    checkError(bindings.moveSmooth!(ex, ey, 5, 10), `MoveSmooth(${ex}, ${ey})`);
+    checkError(bindings.mouseUp!(btn), 'MouseUp');
+    return { success: true };
+  }
+};
+
+function handleMessage(msg: DesktopWorkerRequest): void {
   try {
     if (!lib && !loadLibrary()) {
-      self.postMessage({
-        id,
+      reply({
+        id: msg.id,
         error: `Desktop library not available: ${loadError}`
       });
       return;
     }
-
-    let result: unknown;
-    switch (op) {
-      case 'screenshot': {
-        const sx = Math.max(0, args.x ?? 0);
-        const sy = Math.max(0, args.y ?? 0);
-        const sw = args.w ?? 0;
-        const sh = args.h ?? 0;
-        if (sw <= 0 || sh <= 0) {
-          throw new Error(`Invalid screenshot dimensions: ${sw}x${sh}`);
-        }
-        checkError(
-          bindings.screenshot!(args.path, sx, sy, sw, sh),
-          'Screenshot'
-        );
-        result = { success: true, path: args.path };
-        break;
-      }
-      case 'click': {
-        const btn = args.button || 'left';
-        const count = args.clickCount ?? 1;
-        checkError(
-          bindings.move!(Math.trunc(args.x), Math.trunc(args.y)),
-          'Move'
-        );
-        checkError(bindings.click!(btn, count), 'Click');
-        result = { success: true };
-        break;
-      }
-      case 'move':
-        checkError(
-          bindings.move!(Math.trunc(args.x), Math.trunc(args.y)),
-          'Move'
-        );
-        result = { success: true };
-        break;
-      case 'moveSmooth': {
-        const mx = Math.trunc(args.x);
-        const my = Math.trunc(args.y);
-        checkError(
-          bindings.moveSmooth!(mx, my, args.low ?? 5, args.high ?? 10),
-          `MoveSmooth(${mx}, ${my})`
-        );
-        result = { success: true };
-        break;
-      }
-      case 'scroll':
-        checkError(
-          bindings.move!(Math.trunc(args.x), Math.trunc(args.y)),
-          'Move'
-        );
-        checkError(
-          bindings.scroll!(args.scrollX ?? 0, args.scrollY ?? 0),
-          'Scroll'
-        );
-        result = { success: true };
-        break;
-      case 'type':
-        checkError(bindings.typeText!(args.text, args.pid ?? 0), 'TypeText');
-        result = { success: true };
-        break;
-      case 'keyTap':
-        checkError(bindings.keyTap!(args.key, args.modifiers ?? ''), 'KeyTap');
-        result = { success: true };
-        break;
-      case 'getScreenSize':
-        result = bindings.getScreenSize!();
-        break;
-      case 'getMousePos':
-        result = bindings.getMousePos!();
-        break;
-      case 'mouseDown':
-        if (args.x !== undefined && args.y !== undefined) {
-          checkError(
-            bindings.move!(Math.trunc(args.x), Math.trunc(args.y)),
-            'Move'
-          );
-        }
-        checkError(bindings.mouseDown!(args.button || 'left'), 'MouseDown');
-        result = { success: true };
-        break;
-      case 'mouseUp':
-        if (args.x !== undefined && args.y !== undefined) {
-          checkError(
-            bindings.move!(Math.trunc(args.x), Math.trunc(args.y)),
-            'Move'
-          );
-        }
-        checkError(bindings.mouseUp!(args.button || 'left'), 'MouseUp');
-        result = { success: true };
-        break;
-      case 'keyDown':
-        checkError(bindings.keyDown!(args.key), 'KeyDown');
-        result = { success: true };
-        break;
-      case 'keyUp':
-        checkError(bindings.keyUp!(args.key), 'KeyUp');
-        result = { success: true };
-        break;
-      case 'drag': {
-        const sx = Math.trunc(args.startX);
-        const sy = Math.trunc(args.startY);
-        const ex = Math.trunc(args.endX);
-        const ey = Math.trunc(args.endY);
-        checkError(bindings.move!(sx, sy), 'Move');
-        checkError(bindings.mouseDown!(args.button || 'left'), 'MouseDown');
-        checkError(
-          bindings.moveSmooth!(ex, ey, 5, 10),
-          `MoveSmooth(${ex}, ${ey})`
-        );
-        checkError(bindings.mouseUp!(args.button || 'left'), 'MouseUp');
-        result = { success: true };
-        break;
-      }
-      default:
-        self.postMessage({ id, error: `Unknown operation: ${op}` });
-        return;
+    // Dispatch through the typed handler map. The cast narrows the handler
+    // type to match the specific op, which the generic map cannot express.
+    const handler = handlers[msg.op] as Handler<DesktopWorkerOp> | undefined;
+    if (!handler) {
+      reply({
+        id: msg.id,
+        error: `Unknown operation: ${(msg as { op: string }).op}`
+      });
+      return;
     }
-    self.postMessage({ id, result });
+    const result = handler(msg);
+    reply({ id: msg.id, result });
   } catch (error) {
-    self.postMessage({
-      id,
+    reply({
+      id: msg.id,
       error: error instanceof Error ? error.message : String(error)
     });
   }
-};
+}
+
+// Read newline-delimited JSON from stdin
+const reader = Bun.stdin.stream().getReader();
+const decoder = new TextDecoder();
+let buffer = '';
+
+(async () => {
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value);
+      let idx: number = buffer.indexOf('\n');
+      while (idx !== -1) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+        try {
+          handleMessage(JSON.parse(line) as DesktopWorkerRequest);
+        } catch {
+          // Malformed input — skip
+        }
+        idx = buffer.indexOf('\n');
+      }
+    }
+  } catch {
+    // stdin closed
+  }
+  process.exit(0);
+})();
