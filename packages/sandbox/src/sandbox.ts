@@ -103,7 +103,6 @@ type SandboxConfiguration = {
     name: string;
     normalizeId?: boolean;
   };
-  baseUrl?: string;
   sleepAfter?: string | number;
   keepAlive?: boolean;
   containerTimeouts?: NonNullable<SandboxOptions['containerTimeouts']>;
@@ -112,7 +111,6 @@ type SandboxConfiguration = {
 type CachedSandboxConfiguration = {
   sandboxName?: string;
   normalizeId?: boolean;
-  baseUrl?: string;
   sleepAfter?: string | number;
   keepAlive?: boolean;
   containerTimeouts?: NonNullable<SandboxOptions['containerTimeouts']>;
@@ -121,7 +119,6 @@ type CachedSandboxConfiguration = {
 type ConfigurableSandboxStub = {
   configure?: (configuration: SandboxConfiguration) => Promise<void>;
   setSandboxName?: (name: string, normalizeId?: boolean) => Promise<void>;
-  setBaseUrl?: (baseUrl: string) => Promise<void>;
   setSleepAfter?: (sleepAfter: string | number) => Promise<void>;
   setKeepAlive?: (keepAlive: boolean) => Promise<void>;
   setContainerTimeouts?: (
@@ -182,10 +179,6 @@ function buildSandboxConfiguration(
     };
   }
 
-  if (options?.baseUrl !== undefined && cached?.baseUrl !== options.baseUrl) {
-    configuration.baseUrl = options.baseUrl;
-  }
-
   if (
     options?.sleepAfter !== undefined &&
     cached?.sleepAfter !== options.sleepAfter
@@ -213,7 +206,6 @@ function buildSandboxConfiguration(
 function hasSandboxConfiguration(configuration: SandboxConfiguration): boolean {
   return (
     configuration.sandboxName !== undefined ||
-    configuration.baseUrl !== undefined ||
     configuration.sleepAfter !== undefined ||
     configuration.keepAlive !== undefined ||
     configuration.containerTimeouts !== undefined
@@ -229,9 +221,6 @@ function mergeSandboxConfiguration(
     ...(configuration.sandboxName && {
       sandboxName: configuration.sandboxName.name,
       normalizeId: configuration.sandboxName.normalizeId
-    }),
-    ...(configuration.baseUrl !== undefined && {
-      baseUrl: configuration.baseUrl
     }),
     ...(configuration.sleepAfter !== undefined && {
       sleepAfter: configuration.sleepAfter
@@ -261,12 +250,6 @@ function applySandboxConfiguration(
         configuration.sandboxName.name,
         configuration.sandboxName.normalizeId
       ) ?? Promise.resolve()
-    );
-  }
-
-  if (configuration.baseUrl !== undefined) {
-    operations.push(
-      stub.setBaseUrl?.(configuration.baseUrl) ?? Promise.resolve()
     );
   }
 
@@ -435,7 +418,6 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   private codeInterpreter: CodeInterpreter;
   private sandboxName: string | null = null;
   private normalizeId: boolean = false;
-  private baseUrl: string | null = null;
   private defaultSession: string | null = null;
   envVars: Record<string, string> = {};
   private logger: ReturnType<typeof createLogger>;
@@ -486,6 +468,16 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
    * Can be set via options, env vars, or defaults
    */
   private containerTimeouts = { ...this.DEFAULT_CONTAINER_TIMEOUTS };
+
+  /**
+   * True once containerTimeouts has been written to storage at least once
+   * (either via setContainerTimeouts or restored on cold start). Gates the
+   * idempotency check in setContainerTimeouts so a first explicit call
+   * persists even when the requested values already equal the in-memory
+   * defaults, distinguishing "user intent recorded" from "running on
+   * env/SDK defaults".
+   */
+  private hasStoredContainerTimeouts = false;
 
   /**
    * Desktop environment operations.
@@ -636,13 +628,13 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
 
     this.ctx.blockConcurrencyWhile(async () => {
       this.sandboxName =
-        (await this.ctx.storage.get<string>('sandboxName')) || null;
+        (await this.ctx.storage.get<string>('sandboxName')) ?? null;
       this.normalizeId =
-        (await this.ctx.storage.get<boolean>('normalizeId')) || false;
+        (await this.ctx.storage.get<boolean>('normalizeId')) ?? false;
       this.defaultSession =
-        (await this.ctx.storage.get<string>('defaultSession')) || null;
+        (await this.ctx.storage.get<string>('defaultSession')) ?? null;
       this.keepAliveEnabled =
-        (await this.ctx.storage.get<boolean>('keepAliveEnabled')) || false;
+        (await this.ctx.storage.get<boolean>('keepAliveEnabled')) ?? false;
 
       // Load saved timeout configuration (highest priority)
       const storedTimeouts =
@@ -654,6 +646,7 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
           ...this.containerTimeouts,
           ...storedTimeouts
         };
+        this.hasStoredContainerTimeouts = true;
         // Update the transport retry budget to reflect stored timeouts
         this.client.setRetryTimeoutMs(this.computeRetryTimeoutMs());
       }
@@ -673,13 +666,25 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     });
   }
 
+  // RPC method to set the sandbox name and normalizeId. Set-once — a
+  // subsequent call is a no-op.
+  //
+  // sandboxName and normalizeId are one logical unit. Both storage.put
+  // calls run without an intervening await, so they land in the same
+  // in-memory write buffer and flush as a single atomic transaction on
+  // SQLite-backed Durable Objects. In-memory state is updated only after
+  // both writes commit.
   async setSandboxName(name: string, normalizeId?: boolean): Promise<void> {
-    if (!this.sandboxName) {
-      this.sandboxName = name;
-      this.normalizeId = normalizeId || false;
-      await this.ctx.storage.put('sandboxName', name);
-      await this.ctx.storage.put('normalizeId', this.normalizeId);
-    }
+    if (this.sandboxName !== null) return;
+    const effectiveNormalizeId = normalizeId ?? false;
+
+    await Promise.all([
+      this.ctx.storage.put('sandboxName', name),
+      this.ctx.storage.put('normalizeId', effectiveNormalizeId)
+    ]);
+
+    this.sandboxName = name;
+    this.normalizeId = effectiveNormalizeId;
   }
 
   async configure(configuration: SandboxConfiguration): Promise<void> {
@@ -688,10 +693,6 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
         configuration.sandboxName.name,
         configuration.sandboxName.normalizeId
       );
-    }
-
-    if (configuration.baseUrl !== undefined) {
-      await this.setBaseUrl(configuration.baseUrl);
     }
 
     if (configuration.sleepAfter !== undefined) {
@@ -707,32 +708,24 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
     }
   }
 
-  // RPC method to set the base URL
-  async setBaseUrl(baseUrl: string): Promise<void> {
-    if (!this.baseUrl) {
-      this.baseUrl = baseUrl;
-      await this.ctx.storage.put('baseUrl', baseUrl);
-    } else {
-      if (this.baseUrl !== baseUrl) {
-        throw new Error(
-          'Base URL already set and different from one previously provided'
-        );
-      }
-    }
-  }
-
-  // RPC method to set the sleep timeout
+  // RPC method to set the sleep timeout. Idempotent: re-applying the same
+  // value returns early with no storage write and no timer reset. A real
+  // change persists, then reschedules the activity timer against the new
+  // window length.
   async setSleepAfter(sleepAfter: string | number): Promise<void> {
-    this.sleepAfter = sleepAfter;
+    if (this.sleepAfter === sleepAfter) return;
     await this.ctx.storage.put('sleepAfter', sleepAfter);
-    // Reschedule activity timeout to apply the new sleepAfter value immediately
+    this.sleepAfter = sleepAfter;
     this.renewActivityTimeout();
   }
 
-  // RPC method to enable keepAlive mode
+  // RPC method to enable keepAlive mode. Idempotent: re-applying the same
+  // value returns early. When disabling (true to false), the activity
+  // timer is renewed so the inactivity window counts from now.
   async setKeepAlive(keepAlive: boolean): Promise<void> {
-    this.keepAliveEnabled = keepAlive;
+    if (this.keepAliveEnabled === keepAlive) return;
     await this.ctx.storage.put('keepAliveEnabled', keepAlive);
+    this.keepAliveEnabled = keepAlive;
 
     if (!keepAlive) {
       this.renewActivityTimeout();
@@ -783,7 +776,11 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   }
 
   /**
-   * RPC method to configure container startup timeouts
+   * RPC method to configure container startup timeouts. Idempotent once
+   * the values have been persisted: re-applying the same timeout set is a
+   * no-op. The transport retry budget is recomputed only when at least
+   * one timeout actually changes. Storage is written before the in-memory
+   * mirror and derived state are updated.
    */
   async setContainerTimeouts(
     timeouts: NonNullable<SandboxOptions['containerTimeouts']>
@@ -818,10 +815,24 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
       );
     }
 
-    this.containerTimeouts = validated;
+    // No-op only once the values have been written to storage. A first
+    // explicit call persists even when the values match the env/default-
+    // derived in-memory state so user intent is recorded independently of
+    // how those defaults resolve later.
+    if (
+      this.hasStoredContainerTimeouts &&
+      validated.instanceGetTimeoutMS ===
+        this.containerTimeouts.instanceGetTimeoutMS &&
+      validated.portReadyTimeoutMS ===
+        this.containerTimeouts.portReadyTimeoutMS &&
+      validated.waitIntervalMS === this.containerTimeouts.waitIntervalMS
+    ) {
+      return;
+    }
 
-    // Persist to storage
-    await this.ctx.storage.put('containerTimeouts', this.containerTimeouts);
+    await this.ctx.storage.put('containerTimeouts', validated);
+    this.containerTimeouts = validated;
+    this.hasStoredContainerTimeouts = true;
 
     // Update the transport retry budget to reflect new timeouts
     this.client.setRetryTimeoutMs(this.computeRetryTimeoutMs());
