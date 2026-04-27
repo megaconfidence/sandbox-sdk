@@ -1498,9 +1498,54 @@ export class Sandbox<Env = unknown> extends Container<Env> implements ISandbox {
   }
 
   /**
-   * Cleanup and destroy the sandbox container
+   * In-flight `destroy()` promise. While set, concurrent callers coalesce
+   * onto the same teardown instead of triggering a second one. Cleared when
+   * the underlying work settles, so a later call that genuinely needs to
+   * recreate a destroyed sandbox still runs.
+   *
+   * If the underlying teardown hangs (e.g. `super.destroy()` never resolves
+   * because the Containers control plane is unresponsive), every coalesced
+   * caller hangs on the same promise until the Durable Object is evicted.
+   * This is deliberate: a second concurrent teardown would not make a stuck
+   * control plane unstuck, and spawning one would defeat the point of
+   * coalescing. Callers that need bounded waits must apply their own
+   * timeout around `destroy()`.
+   */
+  private inflightDestroy: Promise<void> | null = null;
+
+  /**
+   * Cleanup and destroy the sandbox container.
+   *
+   * Concurrent calls coalesce: if a previous `destroy()` is still in flight,
+   * subsequent calls await the same underlying work instead of starting a
+   * second teardown. A canonical `sandbox.destroy.coalesced` event is logged
+   * per coalesced call so repeated destroy traffic is observable.
    */
   override async destroy(): Promise<void> {
+    if (this.inflightDestroy) {
+      logCanonicalEvent(this.logger, {
+        event: 'sandbox.destroy.coalesced',
+        outcome: 'success',
+        durationMs: 0
+      });
+      return this.inflightDestroy;
+    }
+
+    // Assigned synchronously so concurrent callers observe the promise
+    // before any await point inside doDestroy().
+    const work = this.doDestroy();
+    this.inflightDestroy = work;
+    try {
+      await work;
+    } finally {
+      // Clears only if the field still references this teardown.
+      if (this.inflightDestroy === work) {
+        this.inflightDestroy = null;
+      }
+    }
+  }
+
+  private async doDestroy(): Promise<void> {
     const startTime = Date.now();
     let mountsProcessed = 0;
     let mountFailures = 0;
