@@ -26,7 +26,7 @@ async function runTask(
     if (!repo || !task) return new Response('invalid body', { status: 400 });
 
     // get the repo name
-    const name = repo.split('/').pop() ?? 'tmp';
+    const name = repo.split('/').pop()?.replace(/\.git$/, '') || 'tmp';
 
     // open sandbox
     const sandbox = getSandbox(env.Sandbox, crypto.randomUUID().slice(0, 8));
