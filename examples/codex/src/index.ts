@@ -60,7 +60,7 @@ async function runTask(
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method !== 'POST') return new Response('not found');
+    if (request.method !== 'POST') return new Response('not found', { status: 404 });
 
     const { pathname } = new URL(request.url);
 
