@@ -53,8 +53,9 @@ async function runTask(
     const logs = getOutput(await sandbox.exec(`codex exec --full-auto '${prompt}'`, { cwd: name }));
     const diff = getOutput(await sandbox.exec('git diff', { cwd: name }));
     return Response.json({ logs, diff });
-  } catch {
-    return new Response('invalid body', { status: 400 });
+  } catch (err) {
+    if (err instanceof SyntaxError) return new Response('invalid body', { status: 400 });
+    throw err;
   }
 }
 
