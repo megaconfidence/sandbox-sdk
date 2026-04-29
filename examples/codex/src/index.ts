@@ -75,7 +75,7 @@ export default {
       return runTask(request, env, '/sub');
     }
 
-    return new Response('not found');
+    return new Response('not found', { status: 404 });
   }
 };
 
