@@ -1,0 +1,8 @@
+# Used by POST / (API key route)
+OPENAI_API_KEY=<YOUR-API-KEY-HERE>
+
+# Used by POST /sub (ChatGPT subscription route)
+# Get this by running `codex login` on a trusted machine, then copying the
+# contents of ~/.codex/auth.json into this variable as a single-line JSON string.
+# See: https://developers.openai.com/codex/auth/ci-cd-auth
+CODEX_AUTH_JSON=<YOUR-AUTH-JSON-HERE>
