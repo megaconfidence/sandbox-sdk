@@ -47,13 +47,11 @@ async function runTask(
 
     // codex has no `--append-system-prompt` flag, so we prepend our system
     // instructions to the user task.
-    const prompt = `${EXTRA_SYSTEM}\n\nTask: ${task.replaceAll('"', '\\"')}`;
+    const prompt = `${EXTRA_SYSTEM}\n\nTask: ${task.replace(/'/g, "'\\''")}`;
 
     // kick off codex in non-interactive mode with the workspace-write sandbox
-    const cmd = `cd ${name} && codex exec --full-auto "${prompt}"`;
-
-    const logs = getOutput(await sandbox.exec(cmd));
-    const diff = getOutput(await sandbox.exec(`cd ${name} && git diff`));
+    const logs = getOutput(await sandbox.exec(`codex exec --full-auto '${prompt}'`, { cwd: name }));
+    const diff = getOutput(await sandbox.exec('git diff', { cwd: name }));
     return Response.json({ logs, diff });
   } catch {
     return new Response('invalid body', { status: 400 });
