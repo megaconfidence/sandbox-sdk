@@ -26,7 +26,11 @@ async function runTask(
     if (!repo || !task) return new Response('invalid body', { status: 400 });
 
     // get the repo name
-    const name = repo.split('/').pop()?.replace(/\.git$/, '') || 'tmp';
+    const name =
+      repo
+        .split('/')
+        .pop()
+        ?.replace(/\.git$/, '') || 'tmp';
 
     // open sandbox
     const sandbox = getSandbox(env.Sandbox, crypto.randomUUID().slice(0, 8));
@@ -50,18 +54,25 @@ async function runTask(
     const prompt = `${EXTRA_SYSTEM}\n\nTask: ${task.replace(/'/g, "'\\''")}`;
 
     // kick off codex in non-interactive mode with the workspace-write sandbox
-    const logs = getOutput(await sandbox.exec(`codex exec --full-auto '${prompt}'`, { cwd: name }));
+    const logs = getOutput(
+      await sandbox.exec(
+        `codex exec --dangerously-bypass-approvals-and-sandbox '${prompt}'`,
+        { cwd: name }
+      )
+    );
     const diff = getOutput(await sandbox.exec('git diff', { cwd: name }));
     return Response.json({ logs, diff });
   } catch (err) {
-    if (err instanceof SyntaxError) return new Response('invalid body', { status: 400 });
+    if (err instanceof SyntaxError)
+      return new Response('invalid body', { status: 400 });
     throw err;
   }
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method !== 'POST') return new Response('not found', { status: 404 });
+    if (request.method !== 'POST')
+      return new Response('not found', { status: 404 });
 
     const { pathname } = new URL(request.url);
 
